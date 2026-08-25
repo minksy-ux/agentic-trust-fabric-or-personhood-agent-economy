@@ -225,8 +225,11 @@ export class LocalTrustRuntime {
 
   consumeNonce(sponsorDid: string, nonce: string, consumedAt: Date = new Date()): boolean {
     requireValidDate(consumedAt, 'Nonce consumption time');
-    const key = `${sponsorDid}:${nonce}`;
-    if (!sponsorDid || !nonce || this.state.consumedNonces.includes(key)) {
+    const key = createNonceKey(sponsorDid, nonce);
+    const legacyKey = `${sponsorDid}:${nonce}`;
+    if (!sponsorDid || !nonce
+      || this.state.consumedNonces.includes(key)
+      || this.state.consumedNonces.includes(legacyKey)) {
       return false;
     }
 
@@ -438,6 +441,9 @@ export class LocalTrustRuntime {
     if (stateHash !== sha256(unsignedState)) {
       throw new Error('Runtime state integrity verification failed.');
     }
+    if (!hasConsistentEscrowHistory(parsed)) {
+      throw new Error('Runtime escrow state is inconsistent with its audit history.');
+    }
     return parsed;
   }
 
@@ -520,6 +526,10 @@ function createBalanceKey(accountDid: string, currency: string): string {
   return `${accountDid}\u0000${currency}`;
 }
 
+function createNonceKey(sponsorDid: string, nonce: string): string {
+  return `v2:${sha256([sponsorDid, nonce])}`;
+}
+
 function cryptoId(...parts: string[]): string {
   return createHash('sha256').update(parts.join('\u0000')).digest('hex');
 }
@@ -594,6 +604,30 @@ function isLedgerHold(value: unknown, escrowId: string): value is LedgerHold {
     && Number.isSafeInteger(value.amountMinor)
     && Number(value.amountMinor) > 0
     && (value.status === 'locked' || value.status === 'released' || value.status === 'refunded');
+}
+
+function hasConsistentEscrowHistory(state: RuntimeState): boolean {
+  return Object.values(state.holds).every((hold) => {
+    const escrowEvents = state.events.filter((event) => event.aggregateId === hold.escrowId);
+    const lockEvents = escrowEvents.filter((event) => event.type === 'escrow-funds-locked');
+    const releaseEvents = escrowEvents.filter((event) => event.type === 'escrow-funds-released');
+    const refundEvents = escrowEvents.filter((event) => event.type === 'escrow-funds-refunded');
+    if (lockEvents.length !== 1 || releaseEvents.length > 1 || refundEvents.length > 1) {
+      return false;
+    }
+
+    const lockEvent = lockEvents[0];
+    if (lockEvent.actorDid !== hold.buyerDid
+      || !isRecord(lockEvent.payload)
+      || lockEvent.payload.currency !== hold.currency
+      || lockEvent.payload.amountMinor !== hold.amountMinor) {
+      return false;
+    }
+
+    return (hold.status === 'locked' && releaseEvents.length === 0 && refundEvents.length === 0)
+      || (hold.status === 'released' && releaseEvents.length === 1 && refundEvents.length === 0)
+      || (hold.status === 'refunded' && releaseEvents.length === 0 && refundEvents.length === 1);
+  });
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

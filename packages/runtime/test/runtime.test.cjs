@@ -45,6 +45,27 @@ test('persists nonce replay protection across runtime restarts', () => withRunti
   assert.equal(reopened.verifyEventChain(), true);
 }));
 
+test('keeps sponsor and nonce identities unambiguous', () => withRuntime((runtime) => {
+  assert.equal(runtime.consumeNonce('did:example:alice', 'secret', new Date('2026-08-25T12:00:00Z')), true);
+  assert.equal(runtime.consumeNonce('did:example', 'alice:secret', new Date('2026-08-25T12:01:00Z')), true);
+  assert.equal(runtime.consumeNonce('did:example:alice', 'secret', new Date('2026-08-25T12:02:00Z')), false);
+  assert.equal(runtime.listEvents().length, 2);
+}));
+
+test('recognizes legacy persisted nonce keys', () => withRuntime((_runtime, filePath) => {
+  const unsignedState = {
+    schemaVersion: '1.0.0',
+    events: [],
+    consumedNonces: ['did:example:sponsor:nonce-001'],
+    balances: {},
+    holds: {},
+  };
+  writeFileSync(filePath, JSON.stringify({ ...unsignedState, stateHash: sha256(unsignedState) }));
+
+  const reopened = new LocalTrustRuntime(filePath);
+  assert.equal(reopened.consumeNonce('did:example:sponsor', 'nonce-001'), false);
+}));
+
 test('rolls back nonce consumption when persistence fails', () => {
   const directory = mkdtempSync(join(tmpdir(), 'atf-runtime-test-'));
   const blockedParent = join(directory, 'not-a-directory');
@@ -110,6 +131,19 @@ test('preserves safe integer ledger arithmetic', () => withRuntime((runtime) => 
   const firstShare = Number(BigInt(Number.MAX_SAFE_INTEGER) * 3_333n / 10_000n);
   assert.equal(runtime.getBalance('did:example:first', 'USDC'), firstShare);
   assert.equal(runtime.getBalance('did:example:second', 'USDC'), Number.MAX_SAFE_INTEGER - firstShare);
+}));
+
+test('refuses escrow holds inconsistent with their audit history', () => withRuntime((runtime, filePath) => {
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+  runtime.lockEscrow('escrow-001', 'did:example:buyer', 'USDC', 75, new Date('2026-08-25T12:01:00Z'));
+
+  const state = JSON.parse(readFileSync(filePath, 'utf8'));
+  state.holds['escrow-001'].amountMinor = 100;
+  const { stateHash: _stateHash, ...unsignedState } = state;
+  state.stateHash = sha256(unsignedState);
+  writeFileSync(filePath, JSON.stringify(state));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /inconsistent with its audit history/);
 }));
 
 test('refuses to load tampered persistent state', () => withRuntime((runtime, filePath) => {
