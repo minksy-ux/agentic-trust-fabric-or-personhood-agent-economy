@@ -1,0 +1,20 @@
+{
+  "name": "agentic-trust-fabric",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/*",
+    "examples/*"
+  ],
+  "scripts": {
+    "atf": "node packages/cli/dist/index.js",
+    "build": "tsc -b packages/identity packages/reputation packages/assurance packages/settlement packages/runtime packages/sdk packages/cli examples/hello-agent-hire",
+    "test": "npm run build && node --test packages/runtime/test/*.test.cjs packages/sdk/test/*.test.cjs packages/cli/test/*.test.cjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.21",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
+    "typescript": "^5.6.3"
+  }
+}

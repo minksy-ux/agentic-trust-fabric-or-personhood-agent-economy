@@ -1,0 +1,19 @@
+{
+  "name": "@agentic-trust-fabric/sdk",
+  "version": "0.1.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@agentic-trust-fabric/assurance": "0.1.0",
+    "@agentic-trust-fabric/identity": "0.1.0",
+    "@agentic-trust-fabric/reputation": "0.1.0",
+    "@agentic-trust-fabric/runtime": "0.1.0",
+    "@agentic-trust-fabric/settlement": "0.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

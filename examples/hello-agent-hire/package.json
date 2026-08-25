@@ -1,0 +1,16 @@
+{
+  "name": "hello-agent-hire",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@agentic-trust-fabric/sdk": "file:../../packages/sdk"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}

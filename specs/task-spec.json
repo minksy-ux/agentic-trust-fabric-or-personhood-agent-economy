@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentictrust.example/specs/task-spec.json",
+  "title": "Machine-Readable Task Specification",
+  "type": "object",
+  "required": ["schemaVersion", "id", "taskType", "inputSchemaUri", "outputSchemaUri", "acceptanceCriteria", "legalTerms"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "id": { "type": "string", "minLength": 1 },
+    "taskType": { "type": "string", "minLength": 1 },
+    "inputSchemaUri": { "type": "string", "format": "uri" },
+    "outputSchemaUri": { "type": "string", "format": "uri" },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "description"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "kind": { "enum": ["json-schema", "test", "formal-proof", "attestation"] },
+          "description": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "legalTerms": {
+      "type": "object",
+      "required": ["ricardianContractUri", "governingJurisdiction", "compliancePolicyUri", "emergencyOverrideDid"],
+      "properties": {
+        "ricardianContractUri": { "type": "string", "format": "uri" },
+        "governingJurisdiction": { "type": "string", "minLength": 2 },
+        "compliancePolicyUri": { "type": "string", "format": "uri" },
+        "emergencyOverrideDid": { "type": "string", "pattern": "^did:" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,13 @@
+{
+  "files": [],
+  "references": [
+    { "path": "./packages/identity" },
+    { "path": "./packages/reputation" },
+    { "path": "./packages/assurance" },
+    { "path": "./packages/settlement" },
+    { "path": "./packages/runtime" },
+    { "path": "./packages/sdk" },
+    { "path": "./packages/cli" },
+    { "path": "./examples/hello-agent-hire" }
+  ]
+}

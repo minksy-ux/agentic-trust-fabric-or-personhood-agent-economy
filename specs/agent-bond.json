@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentictrust.example/specs/agent-bond.json",
+  "title": "Agent Bond",
+  "type": "object",
+  "required": ["schemaVersion", "id", "principalDid", "currency", "initialAmountMinor", "availableAmountMinor", "lockedUntil", "status", "slashHistory"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "id": { "type": "string", "minLength": 1 },
+    "principalDid": { "type": "string", "pattern": "^did:" },
+    "currency": { "type": "string", "minLength": 1 },
+    "initialAmountMinor": { "type": "integer", "minimum": 1 },
+    "availableAmountMinor": { "type": "integer", "minimum": 0 },
+    "lockedUntil": { "type": "string", "format": "date-time" },
+    "status": { "enum": ["active", "partially-slashed", "slashed", "released"] },
+    "slashHistory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["amountMinor", "reason", "evidenceUri", "decidedBy", "decidedAt"],
+        "properties": {
+          "amountMinor": { "type": "integer", "minimum": 1 },
+          "reason": { "type": "string", "minLength": 1 },
+          "evidenceUri": { "type": "string", "format": "uri" },
+          "decidedBy": { "type": "string", "pattern": "^did:" },
+          "decidedAt": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

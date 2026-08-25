@@ -1,0 +1,494 @@
+import {
+  createHash,
+  generateKeyPairSync,
+  sign,
+  verify,
+} from 'node:crypto';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname } from 'node:path';
+
+export type Ed25519KeyPair = {
+  publicKeyPem: string;
+  privateKeyPem: string;
+};
+
+export type FabricEvent = {
+  id: string;
+  aggregateId: string;
+  type: string;
+  actorDid: string;
+  at: string;
+  payload: unknown;
+  previousHash: string;
+  hash: string;
+};
+
+export type AppendEventInput = Omit<FabricEvent, 'previousHash' | 'hash'>;
+
+export type LedgerHold = {
+  escrowId: string;
+  buyerDid: string;
+  currency: string;
+  amountMinor: number;
+  status: 'locked' | 'released' | 'refunded';
+};
+
+export type LedgerPayout = {
+  recipientDid: string;
+  shareBasisPoints: number;
+};
+
+export type EvidenceArtifact = {
+  name: string;
+  mediaType: string;
+  content: unknown;
+  hash: string;
+};
+
+export type EvidencePackage = {
+  schemaVersion: '1.0.0';
+  id: string;
+  transactionId: string;
+  createdAt: string;
+  signerDid: string;
+  keyId: string;
+  artifacts: EvidenceArtifact[];
+  events: FabricEvent[];
+  eventRoot: string;
+  signature: string;
+};
+
+export type CreateEvidencePackageInput = {
+  id: string;
+  transactionId: string;
+  createdAt: Date;
+  signerDid: string;
+  keyId: string;
+  artifacts: Array<Omit<EvidenceArtifact, 'hash'>>;
+  events: FabricEvent[];
+};
+
+type RuntimeState = {
+  schemaVersion: '1.0.0';
+  stateHash: string;
+  events: FabricEvent[];
+  consumedNonces: string[];
+  balances: Record<string, number>;
+  holds: Record<string, LedgerHold>;
+};
+
+const GENESIS_HASH = '0'.repeat(64);
+
+export function canonicalize(value: unknown): string {
+  return serializeCanonical(value, new Set<object>());
+}
+
+export function sha256(value: unknown): string {
+  return createHash('sha256').update(canonicalize(value)).digest('hex');
+}
+
+export function generateEd25519KeyPair(): Ed25519KeyPair {
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  return {
+    publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }).toString(),
+    privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
+  };
+}
+
+export function signArtifact<T extends object>(artifact: T, privateKeyPem: string): T & { signature: string } {
+  const unsigned = withoutTopLevelSignature(artifact);
+  const signature = signCanonical(unsigned, privateKeyPem);
+  return { ...artifact, signature };
+}
+
+export function signCanonical(value: unknown, privateKeyPem: string): string {
+  return sign(null, Buffer.from(canonicalize(value)), privateKeyPem).toString('base64');
+}
+
+export function verifyCanonicalSignature(value: unknown, signature: string, publicKeyPem: string): boolean {
+  if (!signature) {
+    return false;
+  }
+
+  try {
+    return verify(
+      null,
+      Buffer.from(canonicalize(value)),
+      publicKeyPem,
+      Buffer.from(signature, 'base64'),
+    );
+  } catch {
+    return false;
+  }
+}
+
+export function verifyArtifactSignature(artifact: object & { signature: string }, publicKeyPem: string): boolean {
+  return verifyCanonicalSignature(withoutTopLevelSignature(artifact), artifact.signature, publicKeyPem);
+}
+
+export function createEvidencePackage(
+  input: CreateEvidencePackageInput,
+  privateKeyPem: string,
+): EvidencePackage {
+  requireValidDate(input.createdAt, 'Evidence package creation time');
+  if (!input.id || !input.transactionId || !input.signerDid || !input.keyId || input.artifacts.length === 0) {
+    throw new Error('Evidence packages require identifiers, a signer, a key ID, and at least one artifact.');
+  }
+  if (new Set(input.artifacts.map((artifact) => artifact.name)).size !== input.artifacts.length) {
+    throw new Error('Evidence artifact names must be unique.');
+  }
+  if (input.events.length === 0 || !verifyFabricEventChain(input.events)) {
+    throw new Error('Evidence packages require a nonempty valid event chain.');
+  }
+
+  const unsignedPackage = {
+    schemaVersion: '1.0.0' as const,
+    id: input.id,
+    transactionId: input.transactionId,
+    createdAt: input.createdAt.toISOString(),
+    signerDid: input.signerDid,
+    keyId: input.keyId,
+    artifacts: input.artifacts.map((artifact) => ({ ...artifact, hash: sha256(artifact.content) })),
+    events: structuredClone(input.events),
+    eventRoot: sha256(input.events),
+    signature: '',
+  };
+  return signArtifact(unsignedPackage, privateKeyPem);
+}
+
+export function verifyEvidencePackage(evidencePackage: EvidencePackage, publicKeyPem: string): boolean {
+  if (evidencePackage.schemaVersion !== '1.0.0'
+    || evidencePackage.artifacts.length === 0
+    || new Set(evidencePackage.artifacts.map((artifact) => artifact.name)).size !== evidencePackage.artifacts.length
+    || evidencePackage.eventRoot !== sha256(evidencePackage.events)
+    || !verifyFabricEventChain(evidencePackage.events)
+    || evidencePackage.artifacts.some((artifact) => artifact.hash !== sha256(artifact.content))) {
+    return false;
+  }
+  return verifyArtifactSignature(evidencePackage, publicKeyPem);
+}
+
+export function verifyFabricEventChain(events: FabricEvent[]): boolean {
+  const previousByAggregate = new Map<string, string>();
+  const eventIds = new Set<string>();
+
+  for (const event of events) {
+    if (eventIds.has(event.id)) {
+      return false;
+    }
+    eventIds.add(event.id);
+
+    const expectedPreviousHash = previousByAggregate.get(event.aggregateId) ?? GENESIS_HASH;
+    if (event.previousHash !== expectedPreviousHash) {
+      return false;
+    }
+
+    const { hash, ...unsignedEvent } = event;
+    if (hash !== sha256(unsignedEvent)) {
+      return false;
+    }
+    previousByAggregate.set(event.aggregateId, hash);
+  }
+
+  return true;
+}
+
+export class LocalTrustRuntime {
+  readonly filePath: string;
+  private state: RuntimeState;
+
+  constructor(filePath: string) {
+    this.filePath = filePath;
+    this.state = this.load();
+    if (!this.verifyEventChain()) {
+      throw new Error('Runtime event chain verification failed.');
+    }
+  }
+
+  consumeNonce(sponsorDid: string, nonce: string, consumedAt: Date = new Date()): boolean {
+    requireValidDate(consumedAt, 'Nonce consumption time');
+    const key = `${sponsorDid}:${nonce}`;
+    if (!sponsorDid || !nonce || this.state.consumedNonces.includes(key)) {
+      return false;
+    }
+
+    this.state.consumedNonces.push(key);
+    this.appendToState({
+      id: `nonce:${sha256(key)}`,
+      aggregateId: sponsorDid,
+      type: 'mandate-nonce-consumed',
+      actorDid: sponsorDid,
+      at: consumedAt.toISOString(),
+      payload: { nonceHash: sha256(nonce) },
+    });
+    this.persist();
+    return true;
+  }
+
+  appendEvent(input: AppendEventInput): FabricEvent {
+    const event = this.appendToState(input);
+    this.persist();
+    return event;
+  }
+
+  listEvents(aggregateId?: string): FabricEvent[] {
+    return this.state.events
+      .filter((event) => aggregateId === undefined || event.aggregateId === aggregateId)
+      .map((event) => structuredClone(event));
+  }
+
+  verifyEventChain(): boolean {
+    return verifyFabricEventChain(this.state.events);
+  }
+
+  credit(accountDid: string, currency: string, amountMinor: number, creditedAt: Date = new Date()): void {
+    requirePositiveMinorUnits(amountMinor, 'Credit amount');
+    requireValidDate(creditedAt, 'Credit time');
+    const balanceKey = createBalanceKey(accountDid, currency);
+    this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+    this.appendToState({
+      id: `credit:${cryptoId(accountDid, currency, creditedAt.toISOString(), String(this.state.events.length))}`,
+      aggregateId: accountDid,
+      type: 'ledger-credited',
+      actorDid: 'did:atf:local-ledger',
+      at: creditedAt.toISOString(),
+      payload: { currency, amountMinor },
+    });
+    this.persist();
+  }
+
+  getBalance(accountDid: string, currency: string): number {
+    return this.state.balances[createBalanceKey(accountDid, currency)] ?? 0;
+  }
+
+  getHold(escrowId: string): LedgerHold | undefined {
+    const hold = this.state.holds[escrowId];
+    return hold ? structuredClone(hold) : undefined;
+  }
+
+  lockEscrow(
+    escrowId: string,
+    buyerDid: string,
+    currency: string,
+    amountMinor: number,
+    lockedAt: Date = new Date(),
+  ): LedgerHold {
+    requirePositiveMinorUnits(amountMinor, 'Escrow amount');
+    requireValidDate(lockedAt, 'Escrow lock time');
+    if (this.state.holds[escrowId]) {
+      throw new Error('Escrow funds are already recorded.');
+    }
+
+    const balanceKey = createBalanceKey(buyerDid, currency);
+    if ((this.state.balances[balanceKey] ?? 0) < amountMinor) {
+      throw new Error('Buyer has insufficient simulated funds.');
+    }
+
+    this.state.balances[balanceKey] -= amountMinor;
+    const hold: LedgerHold = { escrowId, buyerDid, currency, amountMinor, status: 'locked' };
+    this.state.holds[escrowId] = hold;
+    this.appendToState({
+      id: `escrow:${escrowId}:locked`,
+      aggregateId: escrowId,
+      type: 'escrow-funds-locked',
+      actorDid: buyerDid,
+      at: lockedAt.toISOString(),
+      payload: { currency, amountMinor },
+    });
+    this.persist();
+    return structuredClone(hold);
+  }
+
+  releaseEscrow(
+    escrowId: string,
+    payouts: LedgerPayout[],
+    releasedAt: Date = new Date(),
+  ): LedgerHold {
+    requireValidDate(releasedAt, 'Escrow release time');
+    const hold = this.requireLockedHold(escrowId);
+    validatePayouts(payouts);
+
+    let allocatedMinor = 0;
+    payouts.forEach((payout, index) => {
+      const amountMinor = index === payouts.length - 1
+        ? hold.amountMinor - allocatedMinor
+        : Math.floor(hold.amountMinor * payout.shareBasisPoints / 10_000);
+      allocatedMinor += amountMinor;
+      const balanceKey = createBalanceKey(payout.recipientDid, hold.currency);
+      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+    });
+
+    hold.status = 'released';
+    this.appendToState({
+      id: `escrow:${escrowId}:released`,
+      aggregateId: escrowId,
+      type: 'escrow-funds-released',
+      actorDid: 'did:atf:local-ledger',
+      at: releasedAt.toISOString(),
+      payload: { amountMinor: hold.amountMinor, currency: hold.currency, payouts },
+    });
+    this.persist();
+    return structuredClone(hold);
+  }
+
+  refundEscrow(escrowId: string, refundedAt: Date = new Date()): LedgerHold {
+    requireValidDate(refundedAt, 'Escrow refund time');
+    const hold = this.requireLockedHold(escrowId);
+    const balanceKey = createBalanceKey(hold.buyerDid, hold.currency);
+    this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + hold.amountMinor;
+    hold.status = 'refunded';
+    this.appendToState({
+      id: `escrow:${escrowId}:refunded`,
+      aggregateId: escrowId,
+      type: 'escrow-funds-refunded',
+      actorDid: 'did:atf:local-ledger',
+      at: refundedAt.toISOString(),
+      payload: { amountMinor: hold.amountMinor, currency: hold.currency },
+    });
+    this.persist();
+    return structuredClone(hold);
+  }
+
+  private requireLockedHold(escrowId: string): LedgerHold {
+    const hold = this.state.holds[escrowId];
+    if (!hold || hold.status !== 'locked') {
+      throw new Error('Escrow funds are not in the locked state.');
+    }
+    return hold;
+  }
+
+  private appendToState(input: AppendEventInput): FabricEvent {
+    if (!input.id || !input.aggregateId || !input.type || !input.actorDid) {
+      throw new Error('Audit events require identifiers, a type, and an actor DID.');
+    }
+    if (this.state.events.some((event) => event.id === input.id)) {
+      throw new Error('Audit event ID is already present.');
+    }
+    const at = new Date(input.at);
+    requireValidDate(at, 'Audit event time');
+
+    const previousHash = [...this.state.events]
+      .reverse()
+      .find((event) => event.aggregateId === input.aggregateId)?.hash ?? GENESIS_HASH;
+    const unsignedEvent = { ...input, previousHash };
+    const event: FabricEvent = { ...unsignedEvent, hash: sha256(unsignedEvent) };
+    this.state.events.push(event);
+    return event;
+  }
+
+  private load(): RuntimeState {
+    if (!existsSync(this.filePath)) {
+      const initialState: Omit<RuntimeState, 'stateHash'> = {
+        schemaVersion: '1.0.0',
+        events: [],
+        consumedNonces: [],
+        balances: {},
+        holds: {},
+      };
+      return { ...initialState, stateHash: sha256(initialState) };
+    }
+
+    const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as RuntimeState;
+    if (parsed.schemaVersion !== '1.0.0'
+      || typeof parsed.stateHash !== 'string'
+      || !Array.isArray(parsed.events)
+      || !Array.isArray(parsed.consumedNonces)
+      || typeof parsed.balances !== 'object'
+      || typeof parsed.holds !== 'object') {
+      throw new Error('Runtime state file is invalid or unsupported.');
+    }
+    const { stateHash, ...unsignedState } = parsed;
+    if (stateHash !== sha256(unsignedState)) {
+      throw new Error('Runtime state integrity verification failed.');
+    }
+    return parsed;
+  }
+
+  private persist(): void {
+    mkdirSync(dirname(this.filePath), { recursive: true });
+    const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
+    const { stateHash: _stateHash, ...unsignedState } = this.state;
+    this.state.stateHash = sha256(unsignedState);
+    writeFileSync(temporaryPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+    renameSync(temporaryPath, this.filePath);
+  }
+}
+
+function serializeCanonical(value: unknown, ancestors: Set<object>): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error('Canonical JSON does not support non-finite numbers.');
+    }
+    return JSON.stringify(value);
+  }
+  if (typeof value !== 'object') {
+    throw new Error(`Canonical JSON does not support ${typeof value} values.`);
+  }
+  if (ancestors.has(value)) {
+    throw new Error('Canonical JSON does not support cyclic structures.');
+  }
+
+  ancestors.add(value);
+  try {
+    if (Array.isArray(value)) {
+      return `[${value.map((item) => serializeCanonical(item, ancestors)).join(',')}]`;
+    }
+
+    const record = value as Record<string, unknown>;
+    const entries = Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${serializeCanonical(record[key], ancestors)}`);
+    return `{${entries.join(',')}}`;
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function withoutTopLevelSignature<T extends object>(artifact: T): Omit<T, 'signature'> {
+  const { signature: _signature, ...unsigned } = artifact as T & { signature?: unknown };
+  return unsigned;
+}
+
+function createBalanceKey(accountDid: string, currency: string): string {
+  if (!accountDid || !currency) {
+    throw new Error('Balance entries require an account DID and currency.');
+  }
+  return `${accountDid}\u0000${currency}`;
+}
+
+function cryptoId(...parts: string[]): string {
+  return createHash('sha256').update(parts.join('\u0000')).digest('hex');
+}
+
+function requirePositiveMinorUnits(value: number, label: string): void {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer in currency minor units.`);
+  }
+}
+
+function requireValidDate(value: Date, label: string): void {
+  if (Number.isNaN(value.getTime())) {
+    throw new Error(`${label} must be valid.`);
+  }
+}
+
+function validatePayouts(payouts: LedgerPayout[]): void {
+  if (payouts.length === 0
+    || new Set(payouts.map((payout) => payout.recipientDid)).size !== payouts.length
+    || payouts.some((payout) => !payout.recipientDid
+      || !Number.isSafeInteger(payout.shareBasisPoints)
+      || payout.shareBasisPoints <= 0)
+    || payouts.reduce((total, payout) => total + payout.shareBasisPoints, 0) !== 10_000) {
+    throw new Error('Ledger payouts require unique recipients and positive integer shares totaling 10,000 basis points.');
+  }
+}

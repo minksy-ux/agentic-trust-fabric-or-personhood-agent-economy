@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentictrust.example/specs/evidence-package.json",
+  "title": "Evidence Package",
+  "type": "object",
+  "required": ["schemaVersion", "id", "transactionId", "createdAt", "signerDid", "keyId", "artifacts", "events", "eventRoot", "signature"],
+  "properties": {
+    "schemaVersion": { "const": "1.0.0" },
+    "id": { "type": "string", "minLength": 1 },
+    "transactionId": { "type": "string", "minLength": 1 },
+    "createdAt": { "type": "string", "format": "date-time" },
+    "signerDid": { "type": "string", "pattern": "^did:" },
+    "keyId": { "type": "string", "minLength": 1 },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "mediaType", "content", "hash"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "mediaType": { "type": "string", "minLength": 1 },
+          "content": {},
+          "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "events": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "aggregateId", "type", "actorDid", "at", "payload", "previousHash", "hash"],
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "aggregateId": { "type": "string", "minLength": 1 },
+          "type": { "type": "string", "minLength": 1 },
+          "actorDid": { "type": "string", "pattern": "^did:" },
+          "at": { "type": "string", "format": "date-time" },
+          "payload": {},
+          "previousHash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "eventRoot": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "signature": { "type": "string", "minLength": 1 }
+  },
+  "additionalProperties": false
+}
