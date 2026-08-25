@@ -162,16 +162,20 @@ export function createEvidencePackage(
   return signArtifact(unsignedPackage, privateKeyPem);
 }
 
-export function verifyEvidencePackage(evidencePackage: EvidencePackage, publicKeyPem: string): boolean {
-  if (evidencePackage.schemaVersion !== '1.0.0'
-    || evidencePackage.artifacts.length === 0
-    || new Set(evidencePackage.artifacts.map((artifact) => artifact.name)).size !== evidencePackage.artifacts.length
-    || evidencePackage.eventRoot !== sha256(evidencePackage.events)
-    || !verifyFabricEventChain(evidencePackage.events)
-    || evidencePackage.artifacts.some((artifact) => artifact.hash !== sha256(artifact.content))) {
+export function verifyEvidencePackage(evidencePackage: unknown, publicKeyPem: string): boolean {
+  try {
+    if (!isEvidencePackage(evidencePackage)
+      || evidencePackage.artifacts.length === 0
+      || new Set(evidencePackage.artifacts.map((artifact) => artifact.name)).size !== evidencePackage.artifacts.length
+      || evidencePackage.eventRoot !== sha256(evidencePackage.events)
+      || !verifyFabricEventChain(evidencePackage.events)
+      || evidencePackage.artifacts.some((artifact) => artifact.hash !== sha256(artifact.content))) {
+      return false;
+    }
+    return verifyArtifactSignature(evidencePackage, publicKeyPem);
+  } catch {
     return false;
   }
-  return verifyArtifactSignature(evidencePackage, publicKeyPem);
 }
 
 export function verifyFabricEventChain(events: FabricEvent[]): boolean {
@@ -218,23 +222,22 @@ export class LocalTrustRuntime {
       return false;
     }
 
-    this.state.consumedNonces.push(key);
-    this.appendToState({
-      id: `nonce:${sha256(key)}`,
-      aggregateId: sponsorDid,
-      type: 'mandate-nonce-consumed',
-      actorDid: sponsorDid,
-      at: consumedAt.toISOString(),
-      payload: { nonceHash: sha256(nonce) },
+    return this.commit(() => {
+      this.state.consumedNonces.push(key);
+      this.appendToState({
+        id: `nonce:${sha256(key)}`,
+        aggregateId: sponsorDid,
+        type: 'mandate-nonce-consumed',
+        actorDid: sponsorDid,
+        at: consumedAt.toISOString(),
+        payload: { nonceHash: sha256(nonce) },
+      });
+      return true;
     });
-    this.persist();
-    return true;
   }
 
   appendEvent(input: AppendEventInput): FabricEvent {
-    const event = this.appendToState(input);
-    this.persist();
-    return event;
+    return this.commit(() => this.appendToState(input));
   }
 
   listEvents(aggregateId?: string): FabricEvent[] {
@@ -250,17 +253,18 @@ export class LocalTrustRuntime {
   credit(accountDid: string, currency: string, amountMinor: number, creditedAt: Date = new Date()): void {
     requirePositiveMinorUnits(amountMinor, 'Credit amount');
     requireValidDate(creditedAt, 'Credit time');
-    const balanceKey = createBalanceKey(accountDid, currency);
-    this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
-    this.appendToState({
-      id: `credit:${cryptoId(accountDid, currency, creditedAt.toISOString(), String(this.state.events.length))}`,
-      aggregateId: accountDid,
-      type: 'ledger-credited',
-      actorDid: 'did:atf:local-ledger',
-      at: creditedAt.toISOString(),
-      payload: { currency, amountMinor },
+    this.commit(() => {
+      const balanceKey = createBalanceKey(accountDid, currency);
+      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+      this.appendToState({
+        id: `credit:${cryptoId(accountDid, currency, creditedAt.toISOString(), String(this.state.events.length))}`,
+        aggregateId: accountDid,
+        type: 'ledger-credited',
+        actorDid: 'did:atf:local-ledger',
+        at: creditedAt.toISOString(),
+        payload: { currency, amountMinor },
+      });
     });
-    this.persist();
   }
 
   getBalance(accountDid: string, currency: string): number {
@@ -290,19 +294,20 @@ export class LocalTrustRuntime {
       throw new Error('Buyer has insufficient simulated funds.');
     }
 
-    this.state.balances[balanceKey] -= amountMinor;
-    const hold: LedgerHold = { escrowId, buyerDid, currency, amountMinor, status: 'locked' };
-    this.state.holds[escrowId] = hold;
-    this.appendToState({
-      id: `escrow:${escrowId}:locked`,
-      aggregateId: escrowId,
-      type: 'escrow-funds-locked',
-      actorDid: buyerDid,
-      at: lockedAt.toISOString(),
-      payload: { currency, amountMinor },
+    return this.commit(() => {
+      this.state.balances[balanceKey] -= amountMinor;
+      const hold: LedgerHold = { escrowId, buyerDid, currency, amountMinor, status: 'locked' };
+      this.state.holds[escrowId] = hold;
+      this.appendToState({
+        id: `escrow:${escrowId}:locked`,
+        aggregateId: escrowId,
+        type: 'escrow-funds-locked',
+        actorDid: buyerDid,
+        at: lockedAt.toISOString(),
+        payload: { currency, amountMinor },
+      });
+      return structuredClone(hold);
     });
-    this.persist();
-    return structuredClone(hold);
   }
 
   releaseEscrow(
@@ -311,48 +316,63 @@ export class LocalTrustRuntime {
     releasedAt: Date = new Date(),
   ): LedgerHold {
     requireValidDate(releasedAt, 'Escrow release time');
-    const hold = this.requireLockedHold(escrowId);
     validatePayouts(payouts);
 
-    let allocatedMinor = 0;
-    payouts.forEach((payout, index) => {
-      const amountMinor = index === payouts.length - 1
-        ? hold.amountMinor - allocatedMinor
-        : Math.floor(hold.amountMinor * payout.shareBasisPoints / 10_000);
-      allocatedMinor += amountMinor;
-      const balanceKey = createBalanceKey(payout.recipientDid, hold.currency);
-      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
-    });
+    return this.commit(() => {
+      const hold = this.requireLockedHold(escrowId);
+      let allocatedMinor = 0;
+      payouts.forEach((payout, index) => {
+        const amountMinor = index === payouts.length - 1
+          ? hold.amountMinor - allocatedMinor
+          : Math.floor(hold.amountMinor * payout.shareBasisPoints / 10_000);
+        allocatedMinor += amountMinor;
+        const balanceKey = createBalanceKey(payout.recipientDid, hold.currency);
+        this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+      });
 
-    hold.status = 'released';
-    this.appendToState({
-      id: `escrow:${escrowId}:released`,
-      aggregateId: escrowId,
-      type: 'escrow-funds-released',
-      actorDid: 'did:atf:local-ledger',
-      at: releasedAt.toISOString(),
-      payload: { amountMinor: hold.amountMinor, currency: hold.currency, payouts },
+      hold.status = 'released';
+      this.appendToState({
+        id: `escrow:${escrowId}:released`,
+        aggregateId: escrowId,
+        type: 'escrow-funds-released',
+        actorDid: 'did:atf:local-ledger',
+        at: releasedAt.toISOString(),
+        payload: { amountMinor: hold.amountMinor, currency: hold.currency, payouts },
+      });
+      return structuredClone(hold);
     });
-    this.persist();
-    return structuredClone(hold);
   }
 
   refundEscrow(escrowId: string, refundedAt: Date = new Date()): LedgerHold {
     requireValidDate(refundedAt, 'Escrow refund time');
-    const hold = this.requireLockedHold(escrowId);
-    const balanceKey = createBalanceKey(hold.buyerDid, hold.currency);
-    this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + hold.amountMinor;
-    hold.status = 'refunded';
-    this.appendToState({
-      id: `escrow:${escrowId}:refunded`,
-      aggregateId: escrowId,
-      type: 'escrow-funds-refunded',
-      actorDid: 'did:atf:local-ledger',
-      at: refundedAt.toISOString(),
-      payload: { amountMinor: hold.amountMinor, currency: hold.currency },
+    return this.commit(() => {
+      const hold = this.requireLockedHold(escrowId);
+      const balanceKey = createBalanceKey(hold.buyerDid, hold.currency);
+      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + hold.amountMinor;
+      hold.status = 'refunded';
+      this.appendToState({
+        id: `escrow:${escrowId}:refunded`,
+        aggregateId: escrowId,
+        type: 'escrow-funds-refunded',
+        actorDid: 'did:atf:local-ledger',
+        at: refundedAt.toISOString(),
+        payload: { amountMinor: hold.amountMinor, currency: hold.currency },
+      });
+      return structuredClone(hold);
     });
-    this.persist();
-    return structuredClone(hold);
+  }
+
+  private commit<T>(mutation: () => T): T {
+    const previousState = this.state;
+    this.state = structuredClone(previousState);
+    try {
+      const result = mutation();
+      this.persist();
+      return result;
+    } catch (error) {
+      this.state = previousState;
+      throw error;
+    }
   }
 
   private requireLockedHold(escrowId: string): LedgerHold {
@@ -394,13 +414,8 @@ export class LocalTrustRuntime {
       return { ...initialState, stateHash: sha256(initialState) };
     }
 
-    const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as RuntimeState;
-    if (parsed.schemaVersion !== '1.0.0'
-      || typeof parsed.stateHash !== 'string'
-      || !Array.isArray(parsed.events)
-      || !Array.isArray(parsed.consumedNonces)
-      || typeof parsed.balances !== 'object'
-      || typeof parsed.holds !== 'object') {
+    const parsed = JSON.parse(readFileSync(this.filePath, 'utf8')) as unknown;
+    if (!isRuntimeState(parsed)) {
       throw new Error('Runtime state file is invalid or unsupported.');
     }
     const { stateHash, ...unsignedState } = parsed;
@@ -459,6 +474,29 @@ function withoutTopLevelSignature<T extends object>(artifact: T): Omit<T, 'signa
   return unsigned;
 }
 
+function isEvidencePackage(value: unknown): value is EvidencePackage {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as Partial<EvidencePackage>;
+  return candidate.schemaVersion === '1.0.0'
+    && typeof candidate.id === 'string'
+    && typeof candidate.transactionId === 'string'
+    && typeof candidate.createdAt === 'string'
+    && typeof candidate.signerDid === 'string'
+    && typeof candidate.keyId === 'string'
+    && typeof candidate.eventRoot === 'string'
+    && typeof candidate.signature === 'string'
+    && Array.isArray(candidate.events)
+    && Array.isArray(candidate.artifacts)
+    && candidate.artifacts.every((artifact) => artifact !== null
+      && typeof artifact === 'object'
+      && typeof artifact.name === 'string'
+      && typeof artifact.mediaType === 'string'
+      && typeof artifact.hash === 'string');
+}
+
 function createBalanceKey(accountDid: string, currency: string): string {
   if (!accountDid || !currency) {
     throw new Error('Balance entries require an account DID and currency.');
@@ -491,4 +529,37 @@ function validatePayouts(payouts: LedgerPayout[]): void {
     || payouts.reduce((total, payout) => total + payout.shareBasisPoints, 0) !== 10_000) {
     throw new Error('Ledger payouts require unique recipients and positive integer shares totaling 10,000 basis points.');
   }
+}
+
+function isRuntimeState(value: unknown): value is RuntimeState {
+  if (!isRecord(value)
+    || value.schemaVersion !== '1.0.0'
+    || typeof value.stateHash !== 'string'
+    || !Array.isArray(value.events)
+    || !Array.isArray(value.consumedNonces)
+    || !isRecord(value.balances)
+    || !isRecord(value.holds)) {
+    return false;
+  }
+
+  return value.consumedNonces.every((nonce) => typeof nonce === 'string')
+    && new Set(value.consumedNonces).size === value.consumedNonces.length
+    && Object.values(value.balances).every((balance) => Number.isSafeInteger(balance) && Number(balance) >= 0)
+    && Object.entries(value.holds).every(([escrowId, hold]) => isLedgerHold(hold, escrowId));
+}
+
+function isLedgerHold(value: unknown, escrowId: string): value is LedgerHold {
+  return isRecord(value)
+    && value.escrowId === escrowId
+    && typeof value.buyerDid === 'string'
+    && value.buyerDid.length > 0
+    && typeof value.currency === 'string'
+    && value.currency.length > 0
+    && Number.isSafeInteger(value.amountMinor)
+    && Number(value.amountMinor) > 0
+    && (value.status === 'locked' || value.status === 'released' || value.status === 'refunded');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

@@ -8,6 +8,7 @@ const {
   createEvidencePackage,
   generateEd25519KeyPair,
   LocalTrustRuntime,
+  sha256,
   signArtifact,
   verifyArtifactSignature,
   verifyEvidencePackage,
@@ -43,6 +44,28 @@ test('persists nonce replay protection across runtime restarts', () => withRunti
   assert.equal(reopened.verifyEventChain(), true);
 }));
 
+test('rolls back nonce consumption when persistence fails', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'atf-runtime-test-'));
+  const blockedParent = join(directory, 'not-a-directory');
+  const filePath = join(blockedParent, 'runtime.json');
+  try {
+    writeFileSync(blockedParent, 'blocks directory creation');
+    const runtime = new LocalTrustRuntime(filePath);
+
+    assert.throws(
+      () => runtime.consumeNonce('did:example:sponsor', 'nonce-001', new Date('2026-08-25T12:00:00Z')),
+      { code: 'EEXIST' },
+    );
+    assert.equal(runtime.listEvents().length, 0);
+    assert.throws(
+      () => runtime.consumeNonce('did:example:sponsor', 'nonce-001', new Date('2026-08-25T12:01:00Z')),
+      { code: 'EEXIST' },
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('moves simulated funds through escrow exactly once', () => withRuntime((runtime, filePath) => {
   runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
   runtime.lockEscrow('escrow-001', 'did:example:buyer', 'USDC', 75, new Date('2026-08-25T12:01:00Z'));
@@ -69,6 +92,19 @@ test('refuses to load tampered persistent state', () => withRuntime((runtime, fi
   writeFileSync(filePath, JSON.stringify(state));
 
   assert.throws(() => new LocalTrustRuntime(filePath), /integrity verification failed/);
+}));
+
+test('refuses to load correctly hashed state with invalid ledger values', () => withRuntime((_runtime, filePath) => {
+  const unsignedState = {
+    schemaVersion: '1.0.0',
+    events: [],
+    consumedNonces: [],
+    balances: { 'did:example:buyer\u0000USDC': -100 },
+    holds: {},
+  };
+  writeFileSync(filePath, JSON.stringify({ ...unsignedState, stateHash: sha256(unsignedState) }));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /invalid or unsupported/);
 }));
 
 test('exports a signed evidence package and detects artifact or event mutation', () => withRuntime((runtime) => {
@@ -101,3 +137,23 @@ test('exports a signed evidence package and detects artifact or event mutation',
   mutatedEvents.events[0].type = 'transaction-refunded';
   assert.equal(verifyEvidencePackage(mutatedEvents, keys.publicKeyPem), false);
 }));
+
+test('rejects malformed evidence packages without throwing', () => {
+  const keys = generateEd25519KeyPair();
+
+  assert.equal(verifyEvidencePackage(null, keys.publicKeyPem), false);
+  assert.equal(verifyEvidencePackage({}, keys.publicKeyPem), false);
+  assert.equal(verifyEvidencePackage({ schemaVersion: '1.0.0', artifacts: null }, keys.publicKeyPem), false);
+  assert.equal(verifyEvidencePackage({
+    schemaVersion: '1.0.0',
+    id: 'evidence-001',
+    transactionId: 'transaction-001',
+    createdAt: 'not-a-date',
+    signerDid: 'did:example:auditor',
+    keyId: 'did:example:auditor#key-1',
+    artifacts: [{ name: 'task-spec', mediaType: 'application/json', hash: 'invalid' }],
+    events: [],
+    eventRoot: 'invalid',
+    signature: 'invalid',
+  }, keys.publicKeyPem), false);
+});
