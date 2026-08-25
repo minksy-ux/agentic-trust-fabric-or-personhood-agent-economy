@@ -178,26 +178,34 @@ export function verifyEvidencePackage(evidencePackage: unknown, publicKeyPem: st
   }
 }
 
-export function verifyFabricEventChain(events: FabricEvent[]): boolean {
+export function verifyFabricEventChain(events: unknown): boolean {
+  if (!Array.isArray(events) || !events.every(isFabricEvent)) {
+    return false;
+  }
+
   const previousByAggregate = new Map<string, string>();
   const eventIds = new Set<string>();
 
-  for (const event of events) {
-    if (eventIds.has(event.id)) {
-      return false;
-    }
-    eventIds.add(event.id);
+  try {
+    for (const event of events) {
+      if (eventIds.has(event.id)) {
+        return false;
+      }
+      eventIds.add(event.id);
 
-    const expectedPreviousHash = previousByAggregate.get(event.aggregateId) ?? GENESIS_HASH;
-    if (event.previousHash !== expectedPreviousHash) {
-      return false;
-    }
+      const expectedPreviousHash = previousByAggregate.get(event.aggregateId) ?? GENESIS_HASH;
+      if (event.previousHash !== expectedPreviousHash) {
+        return false;
+      }
 
-    const { hash, ...unsignedEvent } = event;
-    if (hash !== sha256(unsignedEvent)) {
-      return false;
+      const { hash, ...unsignedEvent } = event;
+      if (hash !== sha256(unsignedEvent)) {
+        return false;
+      }
+      previousByAggregate.set(event.aggregateId, hash);
     }
-    previousByAggregate.set(event.aggregateId, hash);
+  } catch {
+    return false;
   }
 
   return true;
@@ -255,7 +263,7 @@ export class LocalTrustRuntime {
     requireValidDate(creditedAt, 'Credit time');
     this.commit(() => {
       const balanceKey = createBalanceKey(accountDid, currency);
-      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+      this.addBalance(balanceKey, amountMinor);
       this.appendToState({
         id: `credit:${cryptoId(accountDid, currency, creditedAt.toISOString(), String(this.state.events.length))}`,
         aggregateId: accountDid,
@@ -324,10 +332,10 @@ export class LocalTrustRuntime {
       payouts.forEach((payout, index) => {
         const amountMinor = index === payouts.length - 1
           ? hold.amountMinor - allocatedMinor
-          : Math.floor(hold.amountMinor * payout.shareBasisPoints / 10_000);
+          : Number(BigInt(hold.amountMinor) * BigInt(payout.shareBasisPoints) / 10_000n);
         allocatedMinor += amountMinor;
         const balanceKey = createBalanceKey(payout.recipientDid, hold.currency);
-        this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+        this.addBalance(balanceKey, amountMinor);
       });
 
       hold.status = 'released';
@@ -348,7 +356,7 @@ export class LocalTrustRuntime {
     return this.commit(() => {
       const hold = this.requireLockedHold(escrowId);
       const balanceKey = createBalanceKey(hold.buyerDid, hold.currency);
-      this.state.balances[balanceKey] = (this.state.balances[balanceKey] ?? 0) + hold.amountMinor;
+      this.addBalance(balanceKey, hold.amountMinor);
       hold.status = 'refunded';
       this.appendToState({
         id: `escrow:${escrowId}:refunded`,
@@ -373,6 +381,14 @@ export class LocalTrustRuntime {
       this.state = previousState;
       throw error;
     }
+  }
+
+  private addBalance(balanceKey: string, amountMinor: number): void {
+    const balance = (this.state.balances[balanceKey] ?? 0) + amountMinor;
+    if (!Number.isSafeInteger(balance)) {
+      throw new Error('Ledger balance exceeds the safe integer range.');
+    }
+    this.state.balances[balanceKey] = balance;
   }
 
   private requireLockedHold(escrowId: string): LedgerHold {
@@ -544,8 +560,28 @@ function isRuntimeState(value: unknown): value is RuntimeState {
 
   return value.consumedNonces.every((nonce) => typeof nonce === 'string')
     && new Set(value.consumedNonces).size === value.consumedNonces.length
+    && value.events.every(isFabricEvent)
     && Object.values(value.balances).every((balance) => Number.isSafeInteger(balance) && Number(balance) >= 0)
     && Object.entries(value.holds).every(([escrowId, hold]) => isLedgerHold(hold, escrowId));
+}
+
+function isFabricEvent(value: unknown): value is FabricEvent {
+  return isRecord(value)
+    && typeof value.id === 'string'
+    && value.id.length > 0
+    && typeof value.aggregateId === 'string'
+    && value.aggregateId.length > 0
+    && typeof value.type === 'string'
+    && value.type.length > 0
+    && typeof value.actorDid === 'string'
+    && value.actorDid.length > 0
+    && typeof value.at === 'string'
+    && !Number.isNaN(new Date(value.at).getTime())
+    && typeof value.previousHash === 'string'
+    && /^[0-9a-f]{64}$/.test(value.previousHash)
+    && typeof value.hash === 'string'
+    && /^[0-9a-f]{64}$/.test(value.hash)
+    && Object.hasOwn(value, 'payload');
 }
 
 function isLedgerHold(value: unknown, escrowId: string): value is LedgerHold {

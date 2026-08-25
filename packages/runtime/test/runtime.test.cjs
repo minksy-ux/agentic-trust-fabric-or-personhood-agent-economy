@@ -12,6 +12,7 @@ const {
   signArtifact,
   verifyArtifactSignature,
   verifyEvidencePackage,
+  verifyFabricEventChain,
 } = require('../dist/index.js');
 
 function withRuntime(run) {
@@ -85,6 +86,32 @@ test('moves simulated funds through escrow exactly once', () => withRuntime((run
   );
 }));
 
+test('preserves safe integer ledger arithmetic', () => withRuntime((runtime) => {
+  runtime.credit('did:example:overflow', 'USDC', Number.MAX_SAFE_INTEGER, new Date('2026-08-25T12:00:00Z'));
+  assert.throws(
+    () => runtime.credit('did:example:overflow', 'USDC', 1, new Date('2026-08-25T12:01:00Z')),
+    /safe integer range/,
+  );
+  assert.equal(runtime.getBalance('did:example:overflow', 'USDC'), Number.MAX_SAFE_INTEGER);
+  assert.equal(runtime.listEvents('did:example:overflow').length, 1);
+
+  runtime.lockEscrow(
+    'escrow-max',
+    'did:example:overflow',
+    'USDC',
+    Number.MAX_SAFE_INTEGER,
+    new Date('2026-08-25T12:02:00Z'),
+  );
+  runtime.releaseEscrow('escrow-max', [
+    { recipientDid: 'did:example:first', shareBasisPoints: 3_333 },
+    { recipientDid: 'did:example:second', shareBasisPoints: 6_667 },
+  ], new Date('2026-08-25T12:03:00Z'));
+
+  const firstShare = Number(BigInt(Number.MAX_SAFE_INTEGER) * 3_333n / 10_000n);
+  assert.equal(runtime.getBalance('did:example:first', 'USDC'), firstShare);
+  assert.equal(runtime.getBalance('did:example:second', 'USDC'), Number.MAX_SAFE_INTEGER - firstShare);
+}));
+
 test('refuses to load tampered persistent state', () => withRuntime((runtime, filePath) => {
   runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
   const state = JSON.parse(readFileSync(filePath, 'utf8'));
@@ -104,6 +131,31 @@ test('refuses to load correctly hashed state with invalid ledger values', () => 
   };
   writeFileSync(filePath, JSON.stringify({ ...unsignedState, stateHash: sha256(unsignedState) }));
 
+  assert.throws(() => new LocalTrustRuntime(filePath), /invalid or unsupported/);
+}));
+
+test('rejects malformed audit events without throwing', () => withRuntime((_runtime, filePath) => {
+  const malformedEvent = {
+    id: 'event-001',
+    aggregateId: 'transaction-001',
+    type: 'transaction-opened',
+    actorDid: 'did:example:buyer',
+    at: 1_787_659_200_000,
+    payload: {},
+    previousHash: '0'.repeat(64),
+    hash: '0'.repeat(64),
+  };
+  assert.equal(verifyFabricEventChain([malformedEvent]), false);
+  assert.equal(verifyFabricEventChain(null), false);
+
+  const unsignedState = {
+    schemaVersion: '1.0.0',
+    events: [malformedEvent],
+    consumedNonces: [],
+    balances: {},
+    holds: {},
+  };
+  writeFileSync(filePath, JSON.stringify({ ...unsignedState, stateHash: sha256(unsignedState) }));
   assert.throws(() => new LocalTrustRuntime(filePath), /invalid or unsupported/);
 }));
 
