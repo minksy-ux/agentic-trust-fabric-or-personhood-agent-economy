@@ -154,7 +154,11 @@ export function createEvidencePackage(
     createdAt: input.createdAt.toISOString(),
     signerDid: input.signerDid,
     keyId: input.keyId,
-    artifacts: input.artifacts.map((artifact) => ({ ...artifact, hash: sha256(artifact.content) })),
+    artifacts: input.artifacts.map((artifact) => ({
+      ...artifact,
+      content: structuredClone(artifact.content),
+      hash: sha256(artifact.content),
+    })),
     events: structuredClone(input.events),
     eventRoot: sha256(input.events),
     signature: '',
@@ -248,7 +252,7 @@ export class LocalTrustRuntime {
   }
 
   appendEvent(input: AppendEventInput): FabricEvent {
-    return this.commit(() => this.appendToState(input));
+    return structuredClone(this.commit(() => this.appendToState(input)));
   }
 
   listEvents(aggregateId?: string): FabricEvent[] {
@@ -348,7 +352,7 @@ export class LocalTrustRuntime {
         type: 'escrow-funds-released',
         actorDid: 'did:atf:local-ledger',
         at: releasedAt.toISOString(),
-        payload: { amountMinor: hold.amountMinor, currency: hold.currency, payouts },
+        payload: { amountMinor: hold.amountMinor, currency: hold.currency, payouts: structuredClone(payouts) },
       });
       return structuredClone(hold);
     });
@@ -415,7 +419,7 @@ export class LocalTrustRuntime {
     const previousHash = [...this.state.events]
       .reverse()
       .find((event) => event.aggregateId === input.aggregateId)?.hash ?? GENESIS_HASH;
-    const unsignedEvent = { ...input, previousHash };
+    const unsignedEvent = { ...input, payload: structuredClone(input.payload), previousHash };
     const event: FabricEvent = { ...unsignedEvent, hash: sha256(unsignedEvent) };
     this.state.events.push(event);
     return event;

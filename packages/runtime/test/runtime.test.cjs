@@ -107,6 +107,34 @@ test('moves simulated funds through escrow exactly once', () => withRuntime((run
   );
 }));
 
+test('isolates audit history from caller-owned objects', () => withRuntime((runtime) => {
+  const payload = { nested: { value: 'original' } };
+  const returnedEvent = runtime.appendEvent({
+    id: 'event-immutable',
+    aggregateId: 'transaction-immutable',
+    type: 'transaction-opened',
+    actorDid: 'did:example:buyer',
+    at: '2026-08-25T12:00:00.000Z',
+    payload,
+  });
+  payload.nested.value = 'mutated-input';
+  returnedEvent.payload.nested.value = 'mutated-result';
+
+  const storedEvent = runtime.listEvents('transaction-immutable')[0];
+  assert.equal(storedEvent.payload.nested.value, 'original');
+  assert.equal(runtime.verifyEventChain(), true);
+
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:01:00Z'));
+  runtime.lockEscrow('escrow-immutable', 'did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:02:00Z'));
+  const payouts = [{ recipientDid: 'did:example:seller', shareBasisPoints: 10_000 }];
+  runtime.releaseEscrow('escrow-immutable', payouts, new Date('2026-08-25T12:03:00Z'));
+  payouts[0].shareBasisPoints = 1;
+
+  const releaseEvent = runtime.listEvents('escrow-immutable').find((event) => event.type === 'escrow-funds-released');
+  assert.equal(releaseEvent.payload.payouts[0].shareBasisPoints, 10_000);
+  assert.equal(runtime.verifyEventChain(), true);
+}));
+
 test('preserves safe integer ledger arithmetic', () => withRuntime((runtime) => {
   runtime.credit('did:example:overflow', 'USDC', Number.MAX_SAFE_INTEGER, new Date('2026-08-25T12:00:00Z'));
   assert.throws(
@@ -203,6 +231,7 @@ test('exports a signed evidence package and detects artifact or event mutation',
     at: '2026-08-25T12:00:00.000Z',
     payload: { escrowId: 'escrow-001' },
   });
+  const artifactContent = { id: 'spec-001' };
   const evidencePackage = createEvidencePackage({
     id: 'evidence-001',
     transactionId: 'transaction-001',
@@ -210,11 +239,12 @@ test('exports a signed evidence package and detects artifact or event mutation',
     signerDid: 'did:example:auditor',
     keyId: 'did:example:auditor#key-1',
     artifacts: [
-      { name: 'task-spec', mediaType: 'application/json', content: { id: 'spec-001' } },
+      { name: 'task-spec', mediaType: 'application/json', content: artifactContent },
     ],
     events: runtime.listEvents('transaction-001'),
   }, keys.privateKeyPem);
 
+  artifactContent.id = 'mutated-source';
   assert.equal(verifyEvidencePackage(evidencePackage, keys.publicKeyPem), true);
   const mutatedArtifact = structuredClone(evidencePackage);
   mutatedArtifact.artifacts[0].content.id = 'spec-002';
