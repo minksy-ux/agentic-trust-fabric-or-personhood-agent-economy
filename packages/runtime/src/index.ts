@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
@@ -84,6 +85,13 @@ type RuntimeState = {
 };
 
 const GENESIS_HASH = '0'.repeat(64);
+const RUNTIME_MANAGED_EVENT_TYPES = new Set([
+  'mandate-nonce-consumed',
+  'ledger-credited',
+  'escrow-funds-locked',
+  'escrow-funds-released',
+  'escrow-funds-refunded',
+]);
 
 export function canonicalize(value: unknown): string {
   return serializeCanonical(value, new Set<object>());
@@ -188,6 +196,7 @@ export function verifyFabricEventChain(events: unknown): boolean {
   }
 
   const previousByAggregate = new Map<string, string>();
+  const timestampByAggregate = new Map<string, number>();
   const eventIds = new Set<string>();
 
   try {
@@ -201,12 +210,18 @@ export function verifyFabricEventChain(events: unknown): boolean {
       if (event.previousHash !== expectedPreviousHash) {
         return false;
       }
+      const timestamp = new Date(event.at).getTime();
+      const previousTimestamp = timestampByAggregate.get(event.aggregateId);
+      if (previousTimestamp !== undefined && timestamp < previousTimestamp) {
+        return false;
+      }
 
       const { hash, ...unsignedEvent } = event;
       if (hash !== sha256(unsignedEvent)) {
         return false;
       }
       previousByAggregate.set(event.aggregateId, hash);
+      timestampByAggregate.set(event.aggregateId, timestamp);
     }
   } catch {
     return false;
@@ -218,6 +233,7 @@ export function verifyFabricEventChain(events: unknown): boolean {
 export class LocalTrustRuntime {
   readonly filePath: string;
   private state: RuntimeState;
+  private persistedStateHash: string | undefined;
 
   constructor(filePath: string) {
     this.filePath = filePath;
@@ -252,6 +268,9 @@ export class LocalTrustRuntime {
   }
 
   appendEvent(input: AppendEventInput): FabricEvent {
+    if (RUNTIME_MANAGED_EVENT_TYPES.has(input.type)) {
+      throw new Error('Runtime-managed audit events must be emitted by the corresponding runtime operation.');
+    }
     return structuredClone(this.commit(() => this.appendToState(input)));
   }
 
@@ -416,9 +435,13 @@ export class LocalTrustRuntime {
     const at = new Date(input.at);
     requireValidDate(at, 'Audit event time');
 
-    const previousHash = [...this.state.events]
+    const previousEvent = [...this.state.events]
       .reverse()
-      .find((event) => event.aggregateId === input.aggregateId)?.hash ?? GENESIS_HASH;
+      .find((event) => event.aggregateId === input.aggregateId);
+    if (previousEvent && at.getTime() < new Date(previousEvent.at).getTime()) {
+      throw new Error('Audit event time must not precede the previous aggregate event.');
+    }
+    const previousHash = previousEvent?.hash ?? GENESIS_HASH;
     const unsignedEvent = { ...input, payload: structuredClone(input.payload), previousHash };
     const event: FabricEvent = { ...unsignedEvent, hash: sha256(unsignedEvent) };
     this.state.events.push(event);
@@ -427,6 +450,7 @@ export class LocalTrustRuntime {
 
   private load(): RuntimeState {
     if (!existsSync(this.filePath)) {
+      this.persistedStateHash = undefined;
       const initialState: Omit<RuntimeState, 'stateHash'> = {
         schemaVersion: '1.0.0',
         events: [],
@@ -448,16 +472,37 @@ export class LocalTrustRuntime {
     if (!hasConsistentEscrowHistory(parsed)) {
       throw new Error('Runtime escrow state is inconsistent with its audit history.');
     }
+    if (!hasConsistentLedgerBalances(parsed)) {
+      throw new Error('Runtime balances are inconsistent with their audit history.');
+    }
+    if (!hasConsistentNonceHistory(parsed)) {
+      throw new Error('Runtime consumed nonces are inconsistent with their audit history.');
+    }
+    this.persistedStateHash = stateHash;
     return parsed;
   }
 
   private persist(): void {
     mkdirSync(dirname(this.filePath), { recursive: true });
+    if (existsSync(this.filePath)) {
+      const persisted = JSON.parse(readFileSync(this.filePath, 'utf8')) as unknown;
+      if (!isRecord(persisted) || persisted.stateHash !== this.persistedStateHash) {
+        throw new Error('Runtime state changed since it was loaded.');
+      }
+    } else if (this.persistedStateHash !== undefined) {
+      throw new Error('Runtime state changed since it was loaded.');
+    }
+
     const temporaryPath = `${this.filePath}.${process.pid}.tmp`;
     const { stateHash: _stateHash, ...unsignedState } = this.state;
     this.state.stateHash = sha256(unsignedState);
-    writeFileSync(temporaryPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporaryPath, this.filePath);
+    try {
+      writeFileSync(temporaryPath, `${JSON.stringify(this.state, null, 2)}\n`, { mode: 0o600 });
+      renameSync(temporaryPath, this.filePath);
+      this.persistedStateHash = this.state.stateHash;
+    } finally {
+      rmSync(temporaryPath, { force: true });
+    }
   }
 }
 
@@ -611,6 +656,16 @@ function isLedgerHold(value: unknown, escrowId: string): value is LedgerHold {
 }
 
 function hasConsistentEscrowHistory(state: RuntimeState): boolean {
+  const escrowEventTypes = new Set([
+    'escrow-funds-locked',
+    'escrow-funds-released',
+    'escrow-funds-refunded',
+  ]);
+  if (state.events.some((event) => escrowEventTypes.has(event.type)
+    && !Object.hasOwn(state.holds, event.aggregateId))) {
+    return false;
+  }
+
   return Object.values(state.holds).every((hold) => {
     const escrowEvents = state.events.filter((event) => event.aggregateId === hold.escrowId);
     const lockEvents = escrowEvents.filter((event) => event.type === 'escrow-funds-locked');
@@ -621,10 +676,16 @@ function hasConsistentEscrowHistory(state: RuntimeState): boolean {
     }
 
     const lockEvent = lockEvents[0];
-    if (lockEvent.actorDid !== hold.buyerDid
+    if (lockEvent.id !== `escrow:${hold.escrowId}:locked`
+      || lockEvent.actorDid !== hold.buyerDid
       || !isRecord(lockEvent.payload)
       || lockEvent.payload.currency !== hold.currency
       || lockEvent.payload.amountMinor !== hold.amountMinor) {
+      return false;
+    }
+
+    if (releaseEvents.some((event) => event.id !== `escrow:${hold.escrowId}:released`)
+      || refundEvents.some((event) => event.id !== `escrow:${hold.escrowId}:refunded`)) {
       return false;
     }
 
@@ -632,6 +693,118 @@ function hasConsistentEscrowHistory(state: RuntimeState): boolean {
       || (hold.status === 'released' && releaseEvents.length === 1 && refundEvents.length === 0)
       || (hold.status === 'refunded' && releaseEvents.length === 0 && refundEvents.length === 1);
   });
+}
+
+function hasConsistentLedgerBalances(state: RuntimeState): boolean {
+  const balances: Record<string, number> = {};
+  const addBalance = (accountDid: string, currency: string, amountMinor: number): boolean => {
+    const key = createBalanceKey(accountDid, currency);
+    const balance = (balances[key] ?? 0) + amountMinor;
+    if (!Number.isSafeInteger(balance) || balance < 0) {
+      return false;
+    }
+    balances[key] = balance;
+    return true;
+  };
+
+  try {
+    for (const [eventIndex, event] of state.events.entries()) {
+      if (event.type === 'ledger-credited') {
+        if (event.actorDid !== 'did:atf:local-ledger'
+          || !isLedgerAmountPayload(event.payload)
+          || event.id !== `credit:${cryptoId(
+            event.aggregateId,
+            event.payload.currency,
+            event.at,
+            String(eventIndex),
+          )}`
+          || !addBalance(event.aggregateId, event.payload.currency, event.payload.amountMinor)) {
+          return false;
+        }
+      } else if (event.type === 'escrow-funds-locked') {
+        const hold = state.holds[event.aggregateId];
+        if (!hold || !addBalance(hold.buyerDid, hold.currency, -hold.amountMinor)) {
+          return false;
+        }
+      } else if (event.type === 'escrow-funds-released') {
+        const hold = state.holds[event.aggregateId];
+        if (!hold || event.actorDid !== 'did:atf:local-ledger'
+          || !isReleasePayload(event.payload, hold)) {
+          return false;
+        }
+
+        let allocatedMinor = 0;
+        for (const [index, payout] of event.payload.payouts.entries()) {
+          const amountMinor = index === event.payload.payouts.length - 1
+            ? hold.amountMinor - allocatedMinor
+            : Number(BigInt(hold.amountMinor) * BigInt(payout.shareBasisPoints) / 10_000n);
+          allocatedMinor += amountMinor;
+          if (!addBalance(payout.recipientDid, hold.currency, amountMinor)) {
+            return false;
+          }
+        }
+      } else if (event.type === 'escrow-funds-refunded') {
+        const hold = state.holds[event.aggregateId];
+        if (!hold || event.actorDid !== 'did:atf:local-ledger'
+          || !isLedgerAmountPayload(event.payload)
+          || event.payload.currency !== hold.currency
+          || event.payload.amountMinor !== hold.amountMinor
+          || !addBalance(hold.buyerDid, hold.currency, hold.amountMinor)) {
+          return false;
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+
+  const expectedEntries = Object.entries(balances);
+  const persistedEntries = Object.entries(state.balances);
+  return expectedEntries.length === persistedEntries.length
+    && expectedEntries.every(([key, balance]) => state.balances[key] === balance);
+}
+
+function hasConsistentNonceHistory(state: RuntimeState): boolean {
+  const modernNonceKeys = state.consumedNonces.filter((key) => key.startsWith('v2:'));
+  const expectedEventIds = new Set(modernNonceKeys.map((key) => `nonce:${sha256(key)}`));
+  const nonceEvents = state.events.filter((event) => event.type === 'mandate-nonce-consumed');
+
+  return nonceEvents.length === expectedEventIds.size
+    && nonceEvents.every((event) => expectedEventIds.has(event.id)
+      && event.actorDid === event.aggregateId
+      && isRecord(event.payload)
+      && typeof event.payload.nonceHash === 'string'
+      && /^[0-9a-f]{64}$/.test(event.payload.nonceHash));
+}
+
+function isLedgerAmountPayload(value: unknown): value is { currency: string; amountMinor: number } {
+  return isRecord(value)
+    && typeof value.currency === 'string'
+    && value.currency.length > 0
+    && Number.isSafeInteger(value.amountMinor)
+    && Number(value.amountMinor) > 0;
+}
+
+function isReleasePayload(
+  value: unknown,
+  hold: LedgerHold,
+): value is { currency: string; amountMinor: number; payouts: LedgerPayout[] } {
+  if (!isRecord(value)
+    || value.currency !== hold.currency
+    || value.amountMinor !== hold.amountMinor
+    || !Array.isArray(value.payouts)
+    || !value.payouts.every((payout) => isRecord(payout)
+      && typeof payout.recipientDid === 'string'
+      && typeof payout.shareBasisPoints === 'number')) {
+    return false;
+  }
+
+  try {
+    validatePayouts(value.payouts as LedgerPayout[]);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

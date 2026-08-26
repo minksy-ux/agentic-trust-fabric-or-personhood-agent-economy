@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const {
@@ -66,6 +66,17 @@ test('recognizes legacy persisted nonce keys', () => withRuntime((_runtime, file
   assert.equal(reopened.consumeNonce('did:example:sponsor', 'nonce-001'), false);
 }));
 
+test('refuses consumed nonces without matching audit events', () => withRuntime((runtime, filePath) => {
+  runtime.consumeNonce('did:example:sponsor', 'nonce-001', new Date('2026-08-25T12:00:00Z'));
+  const state = JSON.parse(readFileSync(filePath, 'utf8'));
+  state.consumedNonces.push(`v2:${'0'.repeat(64)}`);
+  const { stateHash: _stateHash, ...unsignedState } = state;
+  state.stateHash = sha256(unsignedState);
+  writeFileSync(filePath, JSON.stringify(state));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /consumed nonces are inconsistent with their audit history/);
+}));
+
 test('rolls back nonce consumption when persistence fails', () => {
   const directory = mkdtempSync(join(tmpdir(), 'atf-runtime-test-'));
   const blockedParent = join(directory, 'not-a-directory');
@@ -88,6 +99,47 @@ test('rolls back nonce consumption when persistence fails', () => {
   }
 });
 
+test('removes temporary state after a failed atomic rename', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'atf-runtime-test-'));
+  const filePath = join(directory, 'runtime.json');
+  const temporaryPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    const runtime = new LocalTrustRuntime(filePath);
+    mkdirSync(filePath);
+
+    assert.throws(
+      () => runtime.consumeNonce('did:example:sponsor', 'nonce-001', new Date('2026-08-25T12:00:00Z')),
+      { code: 'EISDIR' },
+    );
+    assert.equal(runtime.listEvents().length, 0);
+    assert.equal(existsSync(temporaryPath), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('rejects stale runtime writers instead of losing committed state', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'atf-runtime-test-'));
+  const filePath = join(directory, 'runtime.json');
+  try {
+    const first = new LocalTrustRuntime(filePath);
+    const stale = new LocalTrustRuntime(filePath);
+    first.credit('did:example:first', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+
+    assert.throws(
+      () => stale.credit('did:example:stale', 'USDC', 50, new Date('2026-08-25T12:01:00Z')),
+      /state changed since it was loaded/,
+    );
+    assert.equal(stale.getBalance('did:example:stale', 'USDC'), 0);
+
+    const reopened = new LocalTrustRuntime(filePath);
+    assert.equal(reopened.getBalance('did:example:first', 'USDC'), 100);
+    assert.equal(reopened.getBalance('did:example:stale', 'USDC'), 0);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('moves simulated funds through escrow exactly once', () => withRuntime((runtime, filePath) => {
   runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
   runtime.lockEscrow('escrow-001', 'did:example:buyer', 'USDC', 75, new Date('2026-08-25T12:01:00Z'));
@@ -105,6 +157,46 @@ test('moves simulated funds through escrow exactly once', () => withRuntime((run
     () => reopened.releaseEscrow('escrow-001', [{ recipientDid: 'did:example:seller', shareBasisPoints: 10_000 }]),
     /not in the locked state/,
   );
+}));
+
+test('rejects backdated aggregate events and rolls back ledger mutations', () => withRuntime((runtime) => {
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+  runtime.lockEscrow('escrow-chronology', 'did:example:buyer', 'USDC', 75, new Date('2026-08-25T12:02:00Z'));
+
+  assert.throws(
+    () => runtime.releaseEscrow(
+      'escrow-chronology',
+      [{ recipientDid: 'did:example:seller', shareBasisPoints: 10_000 }],
+      new Date('2026-08-25T12:01:00Z'),
+    ),
+    /must not precede the previous aggregate event/,
+  );
+  assert.equal(runtime.getHold('escrow-chronology').status, 'locked');
+  assert.equal(runtime.getBalance('did:example:seller', 'USDC'), 0);
+  assert.equal(runtime.listEvents('escrow-chronology').length, 1);
+  assert.equal(runtime.verifyEventChain(), true);
+
+  runtime.appendEvent({
+    id: 'event-chronology-1',
+    aggregateId: 'transaction-chronology',
+    type: 'transaction-opened',
+    actorDid: 'did:example:buyer',
+    at: '2026-08-25T12:02:00.000Z',
+    payload: {},
+  });
+  runtime.appendEvent({
+    id: 'event-chronology-2',
+    aggregateId: 'transaction-chronology',
+    type: 'transaction-delivered',
+    actorDid: 'did:example:seller',
+    at: '2026-08-25T12:03:00.000Z',
+    payload: {},
+  });
+  const backdatedEvents = runtime.listEvents('transaction-chronology');
+  backdatedEvents[1].at = '2026-08-25T12:01:00.000Z';
+  const { hash: _hash, ...unsignedEvent } = backdatedEvents[1];
+  backdatedEvents[1].hash = sha256(unsignedEvent);
+  assert.equal(verifyFabricEventChain(backdatedEvents), false);
 }));
 
 test('isolates audit history from caller-owned objects', () => withRuntime((runtime) => {
@@ -133,6 +225,24 @@ test('isolates audit history from caller-owned objects', () => withRuntime((runt
   const releaseEvent = runtime.listEvents('escrow-immutable').find((event) => event.type === 'escrow-funds-released');
   assert.equal(releaseEvent.payload.payouts[0].shareBasisPoints, 10_000);
   assert.equal(runtime.verifyEventChain(), true);
+}));
+
+test('reserves runtime-managed audit event types for runtime operations', () => withRuntime((runtime) => {
+  assert.throws(
+    () => runtime.appendEvent({
+      id: 'escrow:forged:released',
+      aggregateId: 'forged',
+      type: 'escrow-funds-released',
+      actorDid: 'did:example:attacker',
+      at: '2026-08-25T12:00:00.000Z',
+      payload: { amountMinor: 1_000, currency: 'USDC' },
+    }),
+    /Runtime-managed audit events/,
+  );
+  assert.equal(runtime.listEvents().length, 0);
+
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:01:00Z'));
+  assert.equal(runtime.listEvents()[0].type, 'ledger-credited');
 }));
 
 test('preserves safe integer ledger arithmetic', () => withRuntime((runtime) => {
@@ -172,6 +282,68 @@ test('refuses escrow holds inconsistent with their audit history', () => withRun
   writeFileSync(filePath, JSON.stringify(state));
 
   assert.throws(() => new LocalTrustRuntime(filePath), /inconsistent with its audit history/);
+}));
+
+test('refuses escrow lifecycle events with spoofed identifiers', () => withRuntime((runtime, filePath) => {
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+  runtime.lockEscrow('escrow-001', 'did:example:buyer', 'USDC', 75, new Date('2026-08-25T12:01:00Z'));
+
+  const state = JSON.parse(readFileSync(filePath, 'utf8'));
+  const lockEvent = state.events.find((event) => event.type === 'escrow-funds-locked');
+  lockEvent.id = 'escrow:spoofed:locked';
+  const { hash: _eventHash, ...unsignedEvent } = lockEvent;
+  lockEvent.hash = sha256(unsignedEvent);
+  const { stateHash: _stateHash, ...unsignedState } = state;
+  state.stateHash = sha256(unsignedState);
+  writeFileSync(filePath, JSON.stringify(state));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /escrow state is inconsistent with its audit history/);
+}));
+
+test('refuses orphan escrow lifecycle events in correctly hashed state', () => withRuntime((_runtime, filePath) => {
+  const unsignedEvent = {
+    id: 'escrow:forged:released',
+    aggregateId: 'forged',
+    type: 'escrow-funds-released',
+    actorDid: 'did:example:attacker',
+    at: '2026-08-25T12:00:00.000Z',
+    payload: { amountMinor: 1_000, currency: 'USDC' },
+    previousHash: '0'.repeat(64),
+  };
+  const unsignedState = {
+    schemaVersion: '1.0.0',
+    events: [{ ...unsignedEvent, hash: sha256(unsignedEvent) }],
+    consumedNonces: [],
+    balances: {},
+    holds: {},
+  };
+  writeFileSync(filePath, JSON.stringify({ ...unsignedState, stateHash: sha256(unsignedState) }));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /inconsistent with its audit history/);
+}));
+
+test('refuses balances that are inconsistent with ledger history', () => withRuntime((runtime, filePath) => {
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+  const state = JSON.parse(readFileSync(filePath, 'utf8'));
+  state.balances['did:example:buyer\u0000USDC'] = 1_000;
+  const { stateHash: _stateHash, ...unsignedState } = state;
+  state.stateHash = sha256(unsignedState);
+  writeFileSync(filePath, JSON.stringify(state));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /balances are inconsistent with their audit history/);
+}));
+
+test('refuses ledger credit events with spoofed identifiers', () => withRuntime((runtime, filePath) => {
+  runtime.credit('did:example:buyer', 'USDC', 100, new Date('2026-08-25T12:00:00Z'));
+  const state = JSON.parse(readFileSync(filePath, 'utf8'));
+  state.events[0].id = 'credit:spoofed';
+  const { hash: _eventHash, ...unsignedEvent } = state.events[0];
+  state.events[0].hash = sha256(unsignedEvent);
+  const { stateHash: _stateHash, ...unsignedState } = state;
+  state.stateHash = sha256(unsignedState);
+  writeFileSync(filePath, JSON.stringify(state));
+
+  assert.throws(() => new LocalTrustRuntime(filePath), /balances are inconsistent with their audit history/);
 }));
 
 test('refuses to load tampered persistent state', () => withRuntime((runtime, filePath) => {
